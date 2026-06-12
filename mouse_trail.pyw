@@ -80,6 +80,7 @@ AUTOSTART_REG_NAME = "MouseTrail"
 IDT_THICKNESS = 2001
 IDT_OPACITY = 2002
 IDT_FRAMERATE = 2003
+IDT_SKIP_CENTER_THRESHOLD = 2004
 IDC_CLICK_ANIM = 2101
 IDC_TRAIL = 2102
 IDC_OPACITY_VAR = 2103
@@ -392,6 +393,7 @@ def load_settings():
         "trail_enabled": "True",
         "auto_start": "False",
         "skip_center_click": "True",
+        "skip_center_click_threshold": "5",
         "admin_mode": "True",
     }
     for key, value in defaults.items():
@@ -416,6 +418,7 @@ def load_settings():
         "trail_enabled": config.getboolean("Settings", "trail_enabled"),
         "auto_start": auto_start,
         "skip_center_click": config.getboolean("Settings", "skip_center_click"),
+        "skip_center_click_threshold": config.getint("Settings", "skip_center_click_threshold"),
         "admin_mode": config.getboolean("Settings", "admin_mode"),
     }
 
@@ -447,6 +450,8 @@ def save_settings(**kwargs):
         config.set("Settings", "auto_start", str(kwargs["auto_start"]))
     if kwargs.get("skip_center_click") is not None:
         config.set("Settings", "skip_center_click", str(kwargs["skip_center_click"]))
+    if kwargs.get("skip_center_click_threshold") is not None:
+        config.set("Settings", "skip_center_click_threshold", str(kwargs["skip_center_click_threshold"]))
     if kwargs.get("admin_mode") is not None:
         config.set("Settings", "admin_mode", str(kwargs["admin_mode"]))
 
@@ -597,9 +602,12 @@ class TrailOverlay:
     def is_screen_center_click(self, x, y):
         if not self.settings.get("skip_center_click", True):
             return False
+        threshold = max(0, min(20, self.settings.get("skip_center_click_threshold", 5)))
         center_x = self.screen_x + self.screen_w // 2
         center_y = self.screen_y + self.screen_h // 2
-        return x == center_x and y == center_y
+        dx = x - center_x
+        dy = y - center_y
+        return dx * dx + dy * dy <= threshold * threshold
 
     def handle_global_click(self, x, y):
         if self.is_screen_center_click(x, y):
@@ -1019,7 +1027,7 @@ class SettingsDialog:
             120,
             120,
             360,
-            410,
+            440,
             self.parent_hwnd,
             0,
             win32gui.GetModuleHandle(None),
@@ -1050,11 +1058,25 @@ class SettingsDialog:
             244,
             settings["skip_center_click"],
         )
+
+        self._create_label("判断阈值:", 16, 274, 90)
+        threshold = settings["skip_center_click_threshold"]
+        self.controls["skip_center_threshold"] = self._create_trackbar(
+            IDT_SKIP_CENTER_THRESHOLD,
+            110,
+            270,
+            170,
+            0,
+            20,
+            threshold,
+        )
+        self.controls["skip_center_threshold_label"] = self._create_label(f"{threshold}px", 290, 274, 50)
+
         self.controls["admin_mode"] = self._create_checkbox(
             IDC_ADMIN_MODE,
             "管理员模式（应用后重启）",
             16,
-            270,
+            306,
             settings["admin_mode"],
         )
 
@@ -1064,7 +1086,7 @@ class SettingsDialog:
             "应用",
             win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_DEFPUSHBUTTON,
             70,
-            320,
+            350,
             90,
             28,
             self.hwnd,
@@ -1078,7 +1100,7 @@ class SettingsDialog:
             "取消",
             win32con.WS_CHILD | win32con.WS_VISIBLE,
             190,
-            320,
+            350,
             90,
             28,
             self.hwnd,
@@ -1119,6 +1141,7 @@ class SettingsDialog:
             "opacity_enabled": win32gui.SendMessage(self.controls["opacity_var"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
             "width_enabled": win32gui.SendMessage(self.controls["width_var"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
             "skip_center_click": win32gui.SendMessage(self.controls["skip_center_click"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
+            "skip_center_click_threshold": win32gui.SendMessage(self.controls["skip_center_threshold"], TBM_GETPOS, 0, 0),
             "admin_mode": win32gui.SendMessage(self.controls["admin_mode"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
         }
 
@@ -1134,11 +1157,14 @@ class SettingsDialog:
             value = (value // 10) * 10
             win32gui.SendMessage(self.controls["framerate"], TBM_SETPOS, 1, value)
             win32gui.SetWindowText(self.controls["framerate_label"], str(value))
+        elif ctrl_id == IDT_SKIP_CENTER_THRESHOLD:
+            value = win32gui.SendMessage(self.controls["skip_center_threshold"], TBM_GETPOS, 0, 0)
+            win32gui.SetWindowText(self.controls["skip_center_threshold_label"], f"{value}px")
 
     def _window_proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_HSCROLL:
             ctrl_id = win32gui.GetDlgCtrlID(lparam)
-            if ctrl_id in (IDT_THICKNESS, IDT_OPACITY, IDT_FRAMERATE):
+            if ctrl_id in (IDT_THICKNESS, IDT_OPACITY, IDT_FRAMERATE, IDT_SKIP_CENTER_THRESHOLD):
                 self._update_labels(ctrl_id)
             return 0
         if msg == WM_COMMAND:
