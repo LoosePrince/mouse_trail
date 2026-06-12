@@ -1,6 +1,7 @@
 import configparser
 import ctypes
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -83,6 +84,8 @@ IDC_CLICK_ANIM = 2101
 IDC_TRAIL = 2102
 IDC_OPACITY_VAR = 2103
 IDC_WIDTH_VAR = 2104
+IDC_SKIP_CENTER_CLICK = 2105
+IDC_ADMIN_MODE = 2106
 IDC_APPLY = 2201
 IDC_CANCEL = 2202
 
@@ -269,6 +272,43 @@ def get_launch_command():
     return f'"{executable}" "{script}"'
 
 
+def get_launch_executable_and_params():
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable), ""
+    script = os.path.abspath(__file__)
+    executable = sys.executable
+    if executable.lower().endswith("python.exe"):
+        pythonw = os.path.join(os.path.dirname(executable), "pythonw.exe")
+        if os.path.exists(pythonw):
+            executable = pythonw
+    return executable, f'"{script}"'
+
+
+def is_admin():
+    try:
+        return bool(shell32.IsUserAnAdmin())
+    except AttributeError:
+        return False
+
+
+def relaunch_elevated():
+    executable, params = get_launch_executable_and_params()
+    ret = shell32.ShellExecuteW(None, "runas", executable, params, None, 1)
+    if ret <= 32:
+        raise OSError(f"无法以管理员身份启动: {ret}")
+    sys.exit(0)
+
+
+def relaunch_normal():
+    subprocess.Popen(f"explorer.exe {get_launch_command()}", shell=True)
+    sys.exit(0)
+
+
+def ensure_admin_mode(settings):
+    if settings.get("admin_mode", True) and not is_admin():
+        relaunch_elevated()
+
+
 def is_auto_start_enabled():
     try:
         key = win32api.RegOpenKey(
@@ -351,6 +391,8 @@ def load_settings():
         "initial_opacity": "1.0",
         "trail_enabled": "True",
         "auto_start": "False",
+        "skip_center_click": "True",
+        "admin_mode": "True",
     }
     for key, value in defaults.items():
         if not config.has_option("Settings", key):
@@ -373,6 +415,8 @@ def load_settings():
         "initial_opacity": config.getfloat("Settings", "initial_opacity"),
         "trail_enabled": config.getboolean("Settings", "trail_enabled"),
         "auto_start": auto_start,
+        "skip_center_click": config.getboolean("Settings", "skip_center_click"),
+        "admin_mode": config.getboolean("Settings", "admin_mode"),
     }
 
 
@@ -401,6 +445,10 @@ def save_settings(**kwargs):
         config.set("Settings", "trail_enabled", str(kwargs["trail_enabled"]))
     if kwargs.get("auto_start") is not None:
         config.set("Settings", "auto_start", str(kwargs["auto_start"]))
+    if kwargs.get("skip_center_click") is not None:
+        config.set("Settings", "skip_center_click", str(kwargs["skip_center_click"]))
+    if kwargs.get("admin_mode") is not None:
+        config.set("Settings", "admin_mode", str(kwargs["admin_mode"]))
 
     with open(settings_path(), "w", encoding="utf-8") as configfile:
         config.write(configfile)
@@ -546,7 +594,16 @@ class TrailOverlay:
     def global_to_local(self, x, y):
         return x - self.screen_x, y - self.screen_y
 
+    def is_screen_center_click(self, x, y):
+        if not self.settings.get("skip_center_click", True):
+            return False
+        center_x = self.screen_x + self.screen_w // 2
+        center_y = self.screen_y + self.screen_h // 2
+        return x == center_x and y == center_y
+
     def handle_global_click(self, x, y):
+        if self.is_screen_center_click(x, y):
+            return
         local_x, local_y = self.global_to_local(x, y)
         self.click_animations.append(
             {
@@ -962,7 +1019,7 @@ class SettingsDialog:
             120,
             120,
             360,
-            360,
+            410,
             self.parent_hwnd,
             0,
             win32gui.GetModuleHandle(None),
@@ -986,6 +1043,20 @@ class SettingsDialog:
         self.controls["trail"] = self._create_checkbox(IDC_TRAIL, "启用鼠标拖尾", 16, 166, settings["trail_enabled"])
         self.controls["opacity_var"] = self._create_checkbox(IDC_OPACITY_VAR, "启用透明度变化", 16, 192, settings["opacity_enabled"])
         self.controls["width_var"] = self._create_checkbox(IDC_WIDTH_VAR, "启用粗细变化", 16, 218, settings["width_enabled"])
+        self.controls["skip_center_click"] = self._create_checkbox(
+            IDC_SKIP_CENTER_CLICK,
+            "屏幕正中心不显示点击动画",
+            16,
+            244,
+            settings["skip_center_click"],
+        )
+        self.controls["admin_mode"] = self._create_checkbox(
+            IDC_ADMIN_MODE,
+            "管理员模式（应用后重启）",
+            16,
+            270,
+            settings["admin_mode"],
+        )
 
         win32gui.CreateWindowEx(
             0,
@@ -993,7 +1064,7 @@ class SettingsDialog:
             "应用",
             win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_DEFPUSHBUTTON,
             70,
-            270,
+            320,
             90,
             28,
             self.hwnd,
@@ -1007,7 +1078,7 @@ class SettingsDialog:
             "取消",
             win32con.WS_CHILD | win32con.WS_VISIBLE,
             190,
-            270,
+            320,
             90,
             28,
             self.hwnd,
@@ -1047,6 +1118,8 @@ class SettingsDialog:
             "trail_enabled": win32gui.SendMessage(self.controls["trail"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
             "opacity_enabled": win32gui.SendMessage(self.controls["opacity_var"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
             "width_enabled": win32gui.SendMessage(self.controls["width_var"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
+            "skip_center_click": win32gui.SendMessage(self.controls["skip_center_click"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
+            "admin_mode": win32gui.SendMessage(self.controls["admin_mode"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
         }
 
     def _update_labels(self, ctrl_id):
@@ -1325,7 +1398,14 @@ class TrayApp:
                 if result:
                     self.overlay.smooth_mode = False
                     self.smooth_mode = False
+                    old_admin_mode = self.overlay.settings.get("admin_mode", True)
+                    new_admin_mode = result.get("admin_mode", True)
                     self.overlay.apply_settings(result)
+                    if old_admin_mode != new_admin_mode:
+                        if new_admin_mode:
+                            relaunch_elevated()
+                        else:
+                            relaunch_normal()
             elif cmd == IDM_AUTO_START:
                 self.auto_start = not self.auto_start
                 self.settings["auto_start"] = self.auto_start
@@ -1370,6 +1450,7 @@ def main():
 
     gdi = GdiplusSession()
     settings = load_settings()
+    ensure_admin_mode(settings)
     terminal = TerminalWindow()
     overlay = TrailOverlay(terminal, settings)
     tray = TrayApp(overlay, terminal, settings)
