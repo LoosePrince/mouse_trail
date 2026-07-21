@@ -1,6 +1,7 @@
 import configparser
 import ctypes
 import os
+import random
 import subprocess
 import sys
 import time
@@ -81,12 +82,17 @@ IDT_THICKNESS = 2001
 IDT_OPACITY = 2002
 IDT_FRAMERATE = 2003
 IDT_SKIP_CENTER_THRESHOLD = 2004
+IDT_RANDOM_COLOR_INTERVAL = 2005
+IDT_TRAIL_ORIGIN_X = 2006
+IDT_TRAIL_ORIGIN_Y = 2007
 IDC_CLICK_ANIM = 2101
 IDC_TRAIL = 2102
 IDC_OPACITY_VAR = 2103
 IDC_WIDTH_VAR = 2104
 IDC_SKIP_CENTER_CLICK = 2105
 IDC_ADMIN_MODE = 2106
+IDC_RANDOM_COLOR = 2107
+IDC_RANDOM_COLOR_GRADIENT = 2108
 IDC_APPLY = 2201
 IDC_CANCEL = 2202
 
@@ -161,6 +167,37 @@ class CHOOSECOLORW(ctypes.Structure):
     ]
 
 
+class CURSORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hCursor", wintypes.HANDLE),
+        ("ptScreenPos", wintypes.POINT),
+    ]
+
+
+class ICONINFO(ctypes.Structure):
+    _fields_ = [
+        ("fIcon", wintypes.BOOL),
+        ("xHotspot", wintypes.DWORD),
+        ("yHotspot", wintypes.DWORD),
+        ("hbmMask", wintypes.HBITMAP),
+        ("hbmColor", wintypes.HBITMAP),
+    ]
+
+
+class BITMAP(ctypes.Structure):
+    _fields_ = [
+        ("bmType", wintypes.LONG),
+        ("bmWidth", wintypes.LONG),
+        ("bmHeight", wintypes.LONG),
+        ("bmWidthBytes", wintypes.LONG),
+        ("bmPlanes", wintypes.WORD),
+        ("bmBitsPixel", wintypes.WORD),
+        ("bmBits", ctypes.c_void_p),
+    ]
+
+
 _OVERLAY_WINDOWS = {}
 _TRAY_WINDOWS = {}
 _TERMINAL_WINDOWS = {}
@@ -199,6 +236,14 @@ def _init_gdiplus_api():
     gdiplus.GdipAddPathLine2.argtypes = [ctypes.c_void_p, ctypes.POINTER(GpPointF), ctypes.c_int]
     gdiplus.GdipDrawPath.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
     gdiplus.GdipSetPenLineJoin.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
+    user32.GetCursorInfo.restype = wintypes.BOOL
+    user32.GetIconInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(ICONINFO)]
+    user32.GetIconInfo.restype = wintypes.BOOL
+    gdi32.GetObjectW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p]
+    gdi32.GetObjectW.restype = ctypes.c_int
+    gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+    gdi32.DeleteObject.restype = wintypes.BOOL
 
 
 def overlay_wndproc(hwnd, msg, wparam, lparam):
@@ -395,6 +440,11 @@ def load_settings():
         "skip_center_click": "True",
         "skip_center_click_threshold": "5",
         "admin_mode": "True",
+        "random_color_enabled": "False",
+        "random_color_gradient": "False",
+        "random_color_interval": "500",
+        "trail_origin_x": "0",
+        "trail_origin_y": "0",
     }
     for key, value in defaults.items():
         if not config.has_option("Settings", key):
@@ -420,6 +470,11 @@ def load_settings():
         "skip_center_click": config.getboolean("Settings", "skip_center_click"),
         "skip_center_click_threshold": config.getint("Settings", "skip_center_click_threshold"),
         "admin_mode": config.getboolean("Settings", "admin_mode"),
+        "random_color_enabled": config.getboolean("Settings", "random_color_enabled"),
+        "random_color_gradient": config.getboolean("Settings", "random_color_gradient"),
+        "random_color_interval": max(100, min(5000, config.getint("Settings", "random_color_interval"))),
+        "trail_origin_x": max(0, min(100, config.getint("Settings", "trail_origin_x"))),
+        "trail_origin_y": max(0, min(100, config.getint("Settings", "trail_origin_y"))),
     }
 
 
@@ -454,6 +509,16 @@ def save_settings(**kwargs):
         config.set("Settings", "skip_center_click_threshold", str(kwargs["skip_center_click_threshold"]))
     if kwargs.get("admin_mode") is not None:
         config.set("Settings", "admin_mode", str(kwargs["admin_mode"]))
+    if kwargs.get("random_color_enabled") is not None:
+        config.set("Settings", "random_color_enabled", str(kwargs["random_color_enabled"]))
+    if kwargs.get("random_color_gradient") is not None:
+        config.set("Settings", "random_color_gradient", str(kwargs["random_color_gradient"]))
+    if kwargs.get("random_color_interval") is not None:
+        config.set("Settings", "random_color_interval", str(kwargs["random_color_interval"]))
+    if kwargs.get("trail_origin_x") is not None:
+        config.set("Settings", "trail_origin_x", str(kwargs["trail_origin_x"]))
+    if kwargs.get("trail_origin_y") is not None:
+        config.set("Settings", "trail_origin_y", str(kwargs["trail_origin_y"]))
 
     with open(settings_path(), "w", encoding="utf-8") as configfile:
         config.write(configfile)
@@ -516,9 +581,16 @@ class TrailOverlay:
         self.cursor_local = None
         self.click_animations = []
         self.smooth_mode = True
+        self.current_trail_color = settings["trail_color"]
+        self._random_color_from = settings["trail_color"]
+        self._random_color_to = settings["trail_color"]
+        self._random_color_elapsed = 0.0
+        self._last_motion_time = None
+        self._cursor_metrics = {}
         self._layer_dc = None
         self._layer_bmp = None
         self._layer_old = None
+        self._reset_color_cycle()
 
         self.screen_x = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
         self.screen_y = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
@@ -588,16 +660,116 @@ class TrailOverlay:
             user32.SetTimer(self.hwnd, TIMER_TRAIL, 32, None)
 
     def apply_settings(self, new_settings):
+        color_settings = (
+            "trail_color",
+            "random_color_enabled",
+            "random_color_gradient",
+            "random_color_interval",
+        )
+        should_reset_color = any(
+            key in new_settings and new_settings[key] != self.settings.get(key)
+            for key in color_settings
+        )
         self.settings.update(new_settings)
+        if should_reset_color:
+            self._reset_color_cycle()
         save_settings(**new_settings)
         self._apply_timer_interval()
 
     def set_trail_color(self, color):
         self.settings["trail_color"] = color
+        self._reset_color_cycle()
         save_settings(trail_color=color)
+
+    def _pick_random_color(self, previous):
+        for _ in range(8):
+            color = tuple(random.randint(0, 255) for _ in range(3))
+            if sum(abs(a - b) for a, b in zip(color, previous)) >= 160:
+                return color
+        return color
+
+    def _reset_color_cycle(self):
+        base_color = self.settings["trail_color"]
+        self.current_trail_color = base_color
+        self._random_color_from = base_color
+        self._random_color_to = self._pick_random_color(base_color)
+        self._random_color_elapsed = 0.0
+        self._last_motion_time = None
+
+    def _advance_trail_color(self, elapsed):
+        if not self.settings["random_color_enabled"]:
+            self.current_trail_color = self.settings["trail_color"]
+            return
+
+        interval = max(0.1, self.settings["random_color_interval"] / 1000.0)
+        self._random_color_elapsed += elapsed
+        while self._random_color_elapsed >= interval:
+            self._random_color_elapsed -= interval
+            self._random_color_from = self._random_color_to
+            self._random_color_to = self._pick_random_color(self._random_color_from)
+
+        if not self.settings["random_color_gradient"]:
+            self.current_trail_color = self._random_color_from
+            return
+
+        progress = self._random_color_elapsed / interval
+        self.current_trail_color = tuple(
+            round(start + (end - start) * progress)
+            for start, end in zip(self._random_color_from, self._random_color_to)
+        )
 
     def global_to_local(self, x, y):
         return x - self.screen_x, y - self.screen_y
+
+    def _get_cursor_metrics(self):
+        cursor_info = CURSORINFO()
+        cursor_info.cbSize = ctypes.sizeof(CURSORINFO)
+        if not user32.GetCursorInfo(ctypes.byref(cursor_info)) or not cursor_info.hCursor:
+            return 0, 0, 0, 0
+
+        cursor_handle = int(cursor_info.hCursor)
+        cached = self._cursor_metrics.get(cursor_handle)
+        if cached is not None:
+            return cached
+
+        icon_info = ICONINFO()
+        if not user32.GetIconInfo(cursor_info.hCursor, ctypes.byref(icon_info)):
+            return 0, 0, 0, 0
+
+        try:
+            bitmap_handle = icon_info.hbmColor or icon_info.hbmMask
+            bitmap = BITMAP()
+            if not bitmap_handle or not gdi32.GetObjectW(
+                bitmap_handle,
+                ctypes.sizeof(BITMAP),
+                ctypes.byref(bitmap),
+            ):
+                return 0, 0, 0, 0
+            height = bitmap.bmHeight if icon_info.hbmColor else bitmap.bmHeight // 2
+            metrics = (
+                int(icon_info.xHotspot),
+                int(icon_info.yHotspot),
+                int(bitmap.bmWidth),
+                int(height),
+            )
+            self._cursor_metrics[cursor_handle] = metrics
+            return metrics
+        finally:
+            if icon_info.hbmColor:
+                gdi32.DeleteObject(icon_info.hbmColor)
+            if icon_info.hbmMask:
+                gdi32.DeleteObject(icon_info.hbmMask)
+
+    def _trail_origin(self, pointer_x, pointer_y):
+        hotspot_x, hotspot_y, cursor_width, cursor_height = self._get_cursor_metrics()
+        if cursor_width <= 0 or cursor_height <= 0:
+            return pointer_x, pointer_y
+        origin_x = max(0, min(100, self.settings["trail_origin_x"])) / 100.0
+        origin_y = max(0, min(100, self.settings["trail_origin_y"])) / 100.0
+        return (
+            pointer_x - hotspot_x + cursor_width * origin_x,
+            pointer_y - hotspot_y + cursor_height * origin_y,
+        )
 
     def is_screen_center_click(self, x, y):
         if not self.settings.get("skip_center_click", True):
@@ -642,12 +814,18 @@ class TrailOverlay:
 
     def _update_trail(self):
         point = win32gui.GetCursorPos()
-        local_x, local_y = self.global_to_local(point[0], point[1])
+        origin_x, origin_y = self._trail_origin(point[0], point[1])
+        local_x, local_y = self.global_to_local(origin_x, origin_y)
         self.cursor_local = PointF(local_x, local_y)
+        motion_time = time.monotonic()
+        elapsed = 0.0 if self._last_motion_time is None else motion_time - self._last_motion_time
+        self._last_motion_time = motion_time
 
         if self.last_pos is not None and self.last_pos == (local_x, local_y):
             self._render_frame()
             return
+
+        self._advance_trail_color(elapsed)
 
         if self.last_pos is not None:
             distance = abs(local_x - self.last_pos[0]) + abs(local_y - self.last_pos[1])
@@ -655,7 +833,7 @@ class TrailOverlay:
                 self._render_frame()
                 return
 
-        self.trail.append((PointF(local_x, local_y), time.time()))
+        self.trail.append((PointF(local_x, local_y), time.time(), self.current_trail_color))
         if len(self.trail) > self.max_trail_length:
             self.trail.pop(0)
         self.last_pos = (local_x, local_y)
@@ -666,7 +844,7 @@ class TrailOverlay:
 
     def _clean_old_trail(self):
         current_time = time.time()
-        self.trail = [(pos, t) for pos, t in self.trail if current_time - t < 0.5]
+        self.trail = [entry for entry in self.trail if current_time - entry[1] < 0.5]
 
     def _ensure_layer_buffer(self):
         if self._layer_dc is not None:
@@ -775,7 +953,7 @@ class TrailOverlay:
 
     def _draw_scene(self, graphics):
         settings = self.settings
-        r, g, b = settings["trail_color"]
+        r, g, b = self.current_trail_color
 
         if settings["trail_enabled"] and len(self.trail) > 2:
             stroke_batches = []
@@ -787,6 +965,7 @@ class TrailOverlay:
                 p3 = self.trail[i + 2][0] if i + 2 < len(self.trail) else self.trail[i + 1][0]
                 interpolated = catmull_rom_spline(p0, p1, p2, p3, segments=10)
                 age = time.time() - self.trail[i][1]
+                color = self.trail[i][2]
 
                 if settings["opacity_enabled"]:
                     opacity = max(0, (1 - age / 0.5) * settings["initial_opacity"])
@@ -802,7 +981,7 @@ class TrailOverlay:
                     current_batch = None
                     continue
 
-                style_key = (int(opacity * 255) // 12, int(width * 2))
+                style_key = (int(opacity * 255) // 12, int(width * 2), color)
                 if current_batch and current_batch["style_key"] == style_key:
                     current_batch["points"].extend(interpolated[1:])
                 else:
@@ -810,6 +989,7 @@ class TrailOverlay:
                         stroke_batches.append(current_batch)
                     current_batch = {
                         "points": list(interpolated),
+                        "color": color,
                         "opacity": opacity,
                         "width": width,
                         "style_key": style_key,
@@ -819,12 +999,13 @@ class TrailOverlay:
                 stroke_batches.append(current_batch)
 
             for index, batch in enumerate(stroke_batches):
+                batch_r, batch_g, batch_b = batch["color"]
                 self._draw_polyline(
                     graphics,
                     batch["points"],
-                    r,
-                    g,
-                    b,
+                    batch_r,
+                    batch_g,
+                    batch_b,
                     batch["opacity"],
                     batch["width"],
                     round_start=(index == 0),
@@ -1006,7 +1187,7 @@ class SettingsDialog:
             style,
             x,
             y,
-            220,
+            340,
             22,
             self.hwnd,
             ctrl_id,
@@ -1026,8 +1207,8 @@ class SettingsDialog:
             win32con.WS_CAPTION | win32con.WS_SYSMENU | win32con.WS_POPUP,
             120,
             120,
-            360,
-            440,
+            400,
+            650,
             self.parent_hwnd,
             0,
             win32gui.GetModuleHandle(None),
@@ -1047,36 +1228,90 @@ class SettingsDialog:
         self.controls["framerate"] = self._create_trackbar(IDT_FRAMERATE, 100, 94, 180, 10, 240, settings["frame_rate"])
         self.controls["framerate_label"] = self._create_label(str(settings["frame_rate"]), 290, 98, 40)
 
-        self.controls["click_anim"] = self._create_checkbox(IDC_CLICK_ANIM, "启用点击动画", 16, 140, settings["click_animation_enabled"])
-        self.controls["trail"] = self._create_checkbox(IDC_TRAIL, "启用鼠标拖尾", 16, 166, settings["trail_enabled"])
-        self.controls["opacity_var"] = self._create_checkbox(IDC_OPACITY_VAR, "启用透明度变化", 16, 192, settings["opacity_enabled"])
-        self.controls["width_var"] = self._create_checkbox(IDC_WIDTH_VAR, "启用粗细变化", 16, 218, settings["width_enabled"])
+        self.controls["random_color"] = self._create_checkbox(
+            IDC_RANDOM_COLOR,
+            "随机颜色",
+            16,
+            132,
+            settings["random_color_enabled"],
+        )
+        self.controls["random_color_gradient"] = self._create_checkbox(
+            IDC_RANDOM_COLOR_GRADIENT,
+            "随机颜色渐变（需要随机颜色）",
+            16,
+            158,
+            settings["random_color_gradient"],
+        )
+        win32gui.EnableWindow(self.controls["random_color_gradient"], settings["random_color_enabled"])
+
+        self._create_label("换色间隔:", 16, 190, 90)
+        interval = settings["random_color_interval"]
+        self.controls["random_color_interval"] = self._create_trackbar(
+            IDT_RANDOM_COLOR_INTERVAL,
+            110,
+            186,
+            190,
+            100,
+            5000,
+            interval,
+        )
+        self.controls["random_color_interval_label"] = self._create_label(f"{interval}ms", 310, 190, 70)
+
+        self._create_label("拖尾起点相对位置（0:0 左上，100:100 右下）", 16, 228, 360)
+        self._create_label("横向 X:", 16, 258, 80)
+        self.controls["trail_origin_x"] = self._create_trackbar(
+            IDT_TRAIL_ORIGIN_X,
+            100,
+            254,
+            200,
+            0,
+            100,
+            settings["trail_origin_x"],
+        )
+        self.controls["trail_origin_x_label"] = self._create_label(f"{settings['trail_origin_x']}%", 310, 258, 50)
+
+        self._create_label("纵向 Y:", 16, 298, 80)
+        self.controls["trail_origin_y"] = self._create_trackbar(
+            IDT_TRAIL_ORIGIN_Y,
+            100,
+            294,
+            200,
+            0,
+            100,
+            settings["trail_origin_y"],
+        )
+        self.controls["trail_origin_y_label"] = self._create_label(f"{settings['trail_origin_y']}%", 310, 298, 50)
+
+        self.controls["click_anim"] = self._create_checkbox(IDC_CLICK_ANIM, "启用点击动画", 16, 338, settings["click_animation_enabled"])
+        self.controls["trail"] = self._create_checkbox(IDC_TRAIL, "启用鼠标拖尾", 16, 364, settings["trail_enabled"])
+        self.controls["opacity_var"] = self._create_checkbox(IDC_OPACITY_VAR, "启用透明度变化", 16, 390, settings["opacity_enabled"])
+        self.controls["width_var"] = self._create_checkbox(IDC_WIDTH_VAR, "启用粗细变化", 16, 416, settings["width_enabled"])
         self.controls["skip_center_click"] = self._create_checkbox(
             IDC_SKIP_CENTER_CLICK,
             "屏幕正中心不显示点击动画",
             16,
-            244,
+            442,
             settings["skip_center_click"],
         )
 
-        self._create_label("判断阈值:", 16, 274, 90)
+        self._create_label("判断阈值:", 16, 474, 90)
         threshold = settings["skip_center_click_threshold"]
         self.controls["skip_center_threshold"] = self._create_trackbar(
             IDT_SKIP_CENTER_THRESHOLD,
             110,
-            270,
-            170,
+            470,
+            190,
             0,
             20,
             threshold,
         )
-        self.controls["skip_center_threshold_label"] = self._create_label(f"{threshold}px", 290, 274, 50)
+        self.controls["skip_center_threshold_label"] = self._create_label(f"{threshold}px", 310, 474, 50)
 
         self.controls["admin_mode"] = self._create_checkbox(
             IDC_ADMIN_MODE,
             "管理员模式（应用后重启）",
             16,
-            306,
+            512,
             settings["admin_mode"],
         )
 
@@ -1085,8 +1320,8 @@ class SettingsDialog:
             "BUTTON",
             "应用",
             win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_DEFPUSHBUTTON,
-            70,
-            350,
+            90,
+            560,
             90,
             28,
             self.hwnd,
@@ -1099,8 +1334,8 @@ class SettingsDialog:
             "BUTTON",
             "取消",
             win32con.WS_CHILD | win32con.WS_VISIBLE,
-            190,
-            350,
+            220,
+            560,
             90,
             28,
             self.hwnd,
@@ -1132,10 +1367,20 @@ class SettingsDialog:
         opacity = win32gui.SendMessage(self.controls["opacity"], TBM_GETPOS, 0, 0) / 100.0
         frame_rate = win32gui.SendMessage(self.controls["framerate"], TBM_GETPOS, 0, 0)
         frame_rate = (frame_rate // 10) * 10
+        random_color_enabled = win32gui.SendMessage(
+            self.controls["random_color"], win32con.BM_GETCHECK, 0, 0
+        ) == win32con.BST_CHECKED
         return {
             "trail_thickness": thickness,
             "initial_opacity": opacity,
             "frame_rate": frame_rate,
+            "random_color_enabled": random_color_enabled,
+            "random_color_gradient": random_color_enabled and win32gui.SendMessage(
+                self.controls["random_color_gradient"], win32con.BM_GETCHECK, 0, 0
+            ) == win32con.BST_CHECKED,
+            "random_color_interval": win32gui.SendMessage(self.controls["random_color_interval"], TBM_GETPOS, 0, 0),
+            "trail_origin_x": win32gui.SendMessage(self.controls["trail_origin_x"], TBM_GETPOS, 0, 0),
+            "trail_origin_y": win32gui.SendMessage(self.controls["trail_origin_y"], TBM_GETPOS, 0, 0),
             "click_animation_enabled": win32gui.SendMessage(self.controls["click_anim"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
             "trail_enabled": win32gui.SendMessage(self.controls["trail"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
             "opacity_enabled": win32gui.SendMessage(self.controls["opacity_var"], win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED,
@@ -1160,15 +1405,47 @@ class SettingsDialog:
         elif ctrl_id == IDT_SKIP_CENTER_THRESHOLD:
             value = win32gui.SendMessage(self.controls["skip_center_threshold"], TBM_GETPOS, 0, 0)
             win32gui.SetWindowText(self.controls["skip_center_threshold_label"], f"{value}px")
+        elif ctrl_id == IDT_RANDOM_COLOR_INTERVAL:
+            value = win32gui.SendMessage(self.controls["random_color_interval"], TBM_GETPOS, 0, 0)
+            value = max(100, (value // 100) * 100)
+            win32gui.SendMessage(self.controls["random_color_interval"], TBM_SETPOS, 1, value)
+            win32gui.SetWindowText(self.controls["random_color_interval_label"], f"{value}ms")
+        elif ctrl_id == IDT_TRAIL_ORIGIN_X:
+            value = win32gui.SendMessage(self.controls["trail_origin_x"], TBM_GETPOS, 0, 0)
+            win32gui.SetWindowText(self.controls["trail_origin_x_label"], f"{value}%")
+        elif ctrl_id == IDT_TRAIL_ORIGIN_Y:
+            value = win32gui.SendMessage(self.controls["trail_origin_y"], TBM_GETPOS, 0, 0)
+            win32gui.SetWindowText(self.controls["trail_origin_y_label"], f"{value}%")
 
     def _window_proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_HSCROLL:
             ctrl_id = win32gui.GetDlgCtrlID(lparam)
-            if ctrl_id in (IDT_THICKNESS, IDT_OPACITY, IDT_FRAMERATE, IDT_SKIP_CENTER_THRESHOLD):
+            if ctrl_id in (
+                IDT_THICKNESS,
+                IDT_OPACITY,
+                IDT_FRAMERATE,
+                IDT_SKIP_CENTER_THRESHOLD,
+                IDT_RANDOM_COLOR_INTERVAL,
+                IDT_TRAIL_ORIGIN_X,
+                IDT_TRAIL_ORIGIN_Y,
+            ):
                 self._update_labels(ctrl_id)
             return 0
         if msg == WM_COMMAND:
             cmd = win32api_lo(wparam)
+            if cmd == IDC_RANDOM_COLOR:
+                enabled = win32gui.SendMessage(
+                    self.controls["random_color"], win32con.BM_GETCHECK, 0, 0
+                ) == win32con.BST_CHECKED
+                if not enabled:
+                    win32gui.SendMessage(
+                        self.controls["random_color_gradient"],
+                        win32con.BM_SETCHECK,
+                        win32con.BST_UNCHECKED,
+                        0,
+                    )
+                win32gui.EnableWindow(self.controls["random_color_gradient"], enabled)
+                return 0
             if cmd == IDC_APPLY:
                 self.result = self._read_values()
                 win32gui.DestroyWindow(hwnd)
